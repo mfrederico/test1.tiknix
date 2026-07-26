@@ -1,0 +1,20 @@
+{
+    "slug": "publish",
+    "name": "Publish",
+    "steps": [
+        {
+            "name": "publish",
+            "type": "publish",
+            "config": {
+                "target": "github-pr",
+                "op": "deploy"
+            },
+            "on_success": "next",
+            "on_fail": "exit"
+        }
+    ],
+    "publish": {
+        "driver": "github-pr",
+        "url": ""
+    }
+}

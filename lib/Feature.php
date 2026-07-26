@@ -1,0 +1,131 @@
+<?php
+/**
+ * Feature — per-member feature flags.
+ *
+ * Flags are stored as `feature.<key>` rows in the existing member-scoped
+ * `settings` table (one row per member+flag; value '1' = on). Each flag carries a
+ * minimum privilege LEVEL: it is only OFFERED to, and only usable by, members at
+ * or above that level (lower number = higher privilege, per LEVELS). So the
+ * `ecommerce` flag (min_level 50) is available to ADMIN and ROOT, never to a
+ * plain MEMBER — an admin toggles it for an eligible member on the Edit Member
+ * page, and the left-nav "Ecommerce" tab appears for members who have it on.
+ *
+ * isEnabled() re-checks eligibility on every read, so a demotion silently revokes
+ * the flag without any cleanup pass.
+ */
+
+namespace app;
+
+use app\Bean;
+
+class Feature {
+
+    /** Flag catalog: key => ['label', 'blurb', 'min_level']. */
+    public const CATALOG = [
+        // NOTE: the in-core 'ecommerce' flag was removed — the store is now the
+        // shop.tiknix sidecar, gated by the 'shop' flag below (per-instance storefront
+        // + admin, checkout via each instance's own Stripe via controls/Storebroker).
+        'explorer' => [
+            'label'     => 'Architecture Explorer',
+            'blurb'     => 'Visual data-model + call-graph explorer for your instances (heavy; runs as a sidecar). Members can reach it; each grant is per-member.',
+            'min_level' => 100, // MEMBER and above — they own the instances it explores
+        ],
+        'shop' => [
+            'label'     => 'Store',
+            'blurb'     => 'A per-instance storefront + admin, with checkout via that instance\'s own Stripe. Runs as the shop.tiknix sidecar.',
+            'min_level' => 100, // MEMBER and above — they own the instances that get a store
+        ],
+        'pipelines' => [
+            'label'     => 'Pipeline Editor',
+            'blurb'     => 'Build, edit, run + schedule deterministic pipelines in your instances. Runs as the pipelines.tiknix sidecar.',
+            'min_level' => 100, // MEMBER and above — they own the instances whose pipelines they edit
+        ],
+        'publisher' => [
+            'label'     => 'Publisher',
+            'blurb'     => 'Decide where and how a project goes live. Publishing runs as a pipeline in the project itself, so it schedules and debugs like any other. Runs as the publisher.tiknix sidecar — deliberately outside the app, since a finished application should not ship its deployment tooling.',
+            'min_level' => 100, // MEMBER and above — they own the projects they publish
+        ],
+        'workbench' => [
+            'label'     => 'AI Projects',
+            'blurb'     => 'Plan, build + track AI-assisted development tasks per instance. Runs as the workbench.tiknix sidecar; each instance\'s task data lives in its own workbench.db.',
+            'min_level' => 100, // MEMBER and above — they own the instances they build in
+        ],
+    ];
+
+    private static function settingKey(string $flag): string {
+        return 'feature.' . $flag;
+    }
+
+    public static function exists(string $flag): bool {
+        return isset(self::CATALOG[$flag]);
+    }
+
+    /** A member at $level is eligible for $flag when their level is at least its min_level. */
+    public static function eligible(string $flag, int $level): bool {
+        return self::exists($flag) && $level <= (int) self::CATALOG[$flag]['min_level'];
+    }
+
+    /** Catalog entries a member at $level may be offered (used to render toggles). */
+    public static function catalogForLevel(int $level): array {
+        $out = [];
+        foreach (self::CATALOG as $key => $meta) {
+            if ($level <= (int) $meta['min_level']) $out[$key] = $meta;
+        }
+        return $out;
+    }
+
+    /**
+     * Is $flag enabled for a member? Requires BOTH the stored '1' AND that the
+     * member is still eligible for their level, so a demotion revokes access.
+     *
+     * @param int|null $memberId defaults to the current member
+     * @param int|null $level    the member's level (avoids a reload when known)
+     */
+    public static function isEnabled(string $flag, $memberId = null, ?int $level = null): bool {
+        if (!self::exists($flag)) return false;
+        if ($memberId === null) {
+            $m = \Flight::getMember();
+            $memberId = (int) ($m->id ?? 0);
+            if ($level === null) $level = (int) ($m->level ?? 101);
+        }
+        $memberId = (int) $memberId;
+        if ($memberId <= 0) return false;
+        if ($level !== null && !self::eligible($flag, (int) $level)) return false;
+        return self::stored($memberId, $flag) === '1';
+    }
+
+    /** Turn a flag on or off for a member. No-op for unknown flags. */
+    public static function setEnabled(string $flag, bool $on, int $memberId): void {
+        if (!self::exists($flag) || $memberId <= 0) return;
+        $row = Bean::findOne('settings', 'member_id = ? AND setting_key = ?',
+            [$memberId, self::settingKey($flag)]);
+        $now = date('Y-m-d H:i:s');
+        if ($on) {
+            if (!$row || !$row->id) {
+                $row = Bean::dispense('settings');
+                $row->memberId   = $memberId;
+                $row->settingKey = self::settingKey($flag);
+                $row->createdAt  = $now;
+            }
+            $row->settingValue = '1';
+            $row->updatedAt    = $now;
+            Bean::store($row);
+        } elseif ($row && $row->id) {
+            Bean::trash($row);
+        }
+        unset($_SESSION['member_features'][$memberId]); // bust the per-request cache
+    }
+
+    /** Stored value for member+flag, cached per member for the request/session. */
+    private static function stored(int $memberId, string $flag): ?string {
+        if (!isset($_SESSION['member_features'][$memberId])) {
+            $cache = [];
+            foreach (Bean::find('settings',
+                "member_id = ? AND setting_key LIKE 'feature.%'", [$memberId]) as $r) {
+                $cache[(string) $r->settingKey] = (string) $r->settingValue;
+            }
+            $_SESSION['member_features'][$memberId] = $cache;
+        }
+        return $_SESSION['member_features'][$memberId][self::settingKey($flag)] ?? null;
+    }
+}

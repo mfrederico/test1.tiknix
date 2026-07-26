@@ -1,0 +1,293 @@
+<?php
+/**
+ * PlanRunner — headless "decompose a goal into a multi-agent plan" pass.
+ *
+ * Unlike ClaudeRunner (interactive TUI in the browser terminal), this runs
+ * `claude -p` (print / non-interactive) in a detached tmux session against a
+ * single instance. The planner is instructed to ground itself with the tiknix
+ * MCP (codebase_map / whatprovides / describe) and then call the submit_plan
+ * MCP tool, which writes <instance>/.aibuilder/plan.json. The app's
+ * planingest() endpoint turns that file into a reviewable workbench task tree.
+ *
+ * The planner only READS the codebase and WRITES the plan file — it does not
+ * build anything. Execution of the plan is a separate step (the worktree
+ * orchestrator, Phase 2).
+ *
+ * Jailing mirrors ClaudeRunner exactly: when the workspace is a capricorn
+ * instance we run inside jail-run.sh; otherwise (an isolated clone) we run
+ * direct, relying on the PreToolUse security-sandbox hook for confinement.
+ */
+
+namespace app;
+
+class PlanRunner {
+
+    private string $slug;
+    private string $instanceDir;
+    private int $memberId;
+    private int $memberLevel;
+    private string $engine;
+    private string $sessionName;
+    /** Original task ids to remove after the produced plan is ingested (Consolidate feature). */
+    private array $supersedeIds = [];
+
+    public function __construct(string $slug, string $instanceDir, int $memberId, int $memberLevel = 50, string $engine = 'claude') {
+        $this->slug        = $slug;
+        $this->instanceDir = rtrim($instanceDir, '/');
+        $this->memberId    = $memberId;
+        $this->memberLevel = $memberLevel;
+        $this->engine      = $engine;
+        // Distinct from task sessions (tiknix-<m>-task-<id>) so it never collides.
+        $this->sessionName = "tiknix-{$memberId}-plan-{$slug}";
+    }
+
+    public function getSessionName(): string { return $this->sessionName; }
+    private function abDir(): string { return $this->instanceDir . '/.aibuilder'; }
+    public function planFile(): string { return $this->abDir() . '/plan.json'; }
+    public function logFile(): string  { return $this->abDir() . '/planner.log'; }
+    public function requestFile(): string { return $this->abDir() . '/plan-request.md'; }
+
+    /** True while the planner tmux session is alive. */
+    public function running(): bool { return TmuxManager::exists($this->sessionName); }
+
+    /** True once the planner has produced a plan file for ingest. */
+    public function planReady(): bool { return is_file($this->planFile()); }
+
+    /** Last N lines of the planner log for the UI. */
+    public function logTail(int $lines = 40): string {
+        $f = $this->logFile();
+        if (!is_file($f)) return '';
+        $all = @file($f, FILE_IGNORE_NEW_LINES) ?: [];
+        return implode("\n", array_slice($all, -$lines));
+    }
+
+    /**
+     * Launch the headless planner. Writes the request brief, clears any stale
+     * plan, and starts a detached tmux session running `claude -p`. Returns the
+     * session name. Throws on setup failure.
+     */
+    public function start(string $goal, array $supersedeIds = []): string {
+        $this->supersedeIds = array_values(array_filter(array_map('intval', $supersedeIds)));
+        if ($this->running()) {
+            throw new \Exception('A planner is already running for this instance.');
+        }
+        $ab = $this->abDir();
+        if (!is_dir($ab) && !@mkdir($ab, 0775, true)) {
+            throw new \Exception('Could not create .aibuilder dir.');
+        }
+        // Fresh slate: drop a prior plan/log so status polling is unambiguous.
+        @unlink($this->planFile());
+        @unlink($this->logFile());
+
+        file_put_contents($this->requestFile(), $this->buildPlanRequest($goal));
+
+        $script = $this->buildRunnerScript();
+        $scriptFile = $ab . '/run-planner.sh';
+        file_put_contents($scriptFile, $script);
+        @chmod($scriptFile, 0755);
+
+        TmuxManager::create($this->sessionName, $scriptFile, $this->instanceDir);
+        usleep(400000);
+        if (!$this->running()) {
+            throw new \Exception('Planner session failed to start (see planner.log).');
+        }
+        return $this->sessionName;
+    }
+
+    /** Kill the planner session (cancel). */
+    public function stop(): bool { return TmuxManager::kill($this->sessionName); }
+
+    /**
+     * jail-run.sh path when the workspace is a jailable capricorn instance,
+     * else '' (run direct). Mirrors ClaudeRunner::jailFor.
+     */
+    private function jailFor(): string {
+        $root = '/var/www/html/default';
+        $real = realpath($this->instanceDir) ?: $this->instanceDir;
+        if (strpos(basename($real), '.') === false) return '';
+        if (strpos($real, $root . '/') !== 0) return '';
+        if (!is_file("$real/public/index.php")) return '';
+        $cfg = @parse_ini_file(dirname(__DIR__) . '/conf/aibuilder.ini', true) ?: [];
+        $binDir = rtrim($cfg['ops']['bin_dir'] ?? '/home/ubuntu/capricorn/bin', '/');
+        $script = "$binDir/jail-run.sh";
+        return is_file($script) ? $script : '';
+    }
+
+    /**
+     * The detached runner script. Headless `claude -p` with a tiny, quote-safe
+     * positional prompt that points at the full brief file (so no long/complex
+     * text has to survive escaping through jail-run.sh). Planner model = opus.
+     */
+    private function buildRunnerScript(): string {
+        $mainProjectRoot = dirname(__DIR__);
+        $ws  = $this->instanceDir;
+        $log = $this->logFile();
+        // Kept minimal + quote-safe: the real instructions live in plan-request.md,
+        // which the planner reads with its own Read tool inside the workspace.
+        $shortPrompt = 'Read the file .aibuilder/plan-request.md and follow its instructions exactly. You MUST finish by calling the submit_plan tool.';
+        // Planner is SELECTABLE: the model comes from the engine's planner tier in the
+        // registry (§7), not a hardcoded opus. claude's planner tier is opus (unchanged);
+        // another engine declares its own. Dispatch stays on the claude launcher until a
+        // non-claude engine's headless jail path is wired (Phase A) — the tier still applies.
+        $engine = EngineRegistry::isValid($this->engine) ? $this->engine : EngineRegistry::defaultEngine();
+        // The member who triggered the decompose may override the planner (decomp) model
+        // in their settings; absent an override this is the engine's registry planner tier.
+        $model  = MemberEnginePrefs::model($this->memberId, $engine, 'planner', 'opus');
+
+        $jail = $this->jailFor();
+        if ($jail !== '') {
+            // jail-run.sh <workspace> -- <claude args>. The jail itself runs
+            //   claude --permission-mode bypassPermissions <our args>
+            // (see capricorn/bin/jail-run.sh:152), so we only add -p + model —
+            // permissions are already bypassed and creds are the instance's own.
+            $runBlock = escapeshellarg($jail) . ' ' . escapeshellarg($ws)
+                      . ' -- -p ' . escapeshellarg($shortPrompt) . ' --model ' . escapeshellarg($model);
+        } else {
+            $claude = 'claude -p ' . escapeshellarg($shortPrompt)
+                    . ' --model ' . escapeshellarg($model) . ' --dangerously-skip-permissions';
+            $runBlock = 'cd ' . escapeshellarg($ws) . " && " . $claude;
+        }
+
+        $logArg     = escapeshellarg($log);
+        $ingestArg  = escapeshellarg($mainProjectRoot . '/scripts/plan-ingest.php');
+        $planJsonArg = escapeshellarg($ws . '/.aibuilder/plan.json');
+        $slugArg    = escapeshellarg($this->slug);
+        $wsArg      = escapeshellarg($ws);
+        $supersedeArg = $this->supersedeIds
+            ? ' --supersede=' . escapeshellarg(implode(',', $this->supersedeIds))
+            : '';
+        // Sidecar workspace DB: propagate the per-instance workbench.db path (set by the AI
+        // Projects sidecar via putenv) so plan-ingest.php's bootstrap writes the decomposed
+        // plan to THAT db, not core's. INERT for core's own /workbench (env unset).
+        $wsDbEnv  = getenv('TIKNIX_WORKBENCH_DB');
+        $wsExport = ($wsDbEnv !== false && $wsDbEnv !== '')
+            ? "export TIKNIX_WORKBENCH_DB=" . escapeshellarg($wsDbEnv) . "\n" : '';
+        return <<<BASH
+#!/bin/bash
+# Tiknix headless planner (claude -p) — instance {$this->slug}
+export TIKNIX_MEMBER_ID={$this->memberId}
+export TIKNIX_MEMBER_LEVEL={$this->memberLevel}
+export TIKNIX_SESSION_NAME="{$this->sessionName}"
+export TIKNIX_PROJECT_ROOT="{$mainProjectRoot}"
+export TIKNIX_WORKSPACE="{$ws}"
+{$wsExport}export CLAUDE_CODE_MAX_OUTPUT_TOKENS=250000
+
+echo "[planner] instance {$this->slug} starting \$(date)" | tee {$logArg}
+{$runBlock} 2>&1 | tee -a {$logArg}
+echo "[planner] exit=\${PIPESTATUS[0]} \$(date)" | tee -a {$logArg}
+# Server-side ingest the moment the planner finishes, so the plan lands in the
+# Workbench with no browser tab needing to stay open. Atomic-claim makes this
+# race-safe with the AI Builder browser poll (whichever wins ingests once).
+if [ -f {$planJsonArg} ]; then
+  echo "[planner] ingesting plan into the workbench…" | tee -a {$logArg}
+  php {$ingestArg} --slug={$slugArg} --dir={$wsArg} --member={$this->memberId} --app=tiknix{$supersedeArg} 2>&1 | tee -a {$logArg}
+fi
+BASH;
+    }
+
+    /**
+     * The decomposition brief. Strict, JSON-tool-terminated (myctobot pattern),
+     * tiknix-flavored: ground first, then submit a dependency graph where
+     * independent tasks can run in parallel (they will, in isolated git
+     * worktrees), and file-overlapping tasks are chained via depends_on.
+     */
+    private function buildPlanRequest(string $goal): string {
+        $goal = trim($goal);
+        $digest = $this->codebaseDigest();
+        return <<<MD
+# AI Builder — Plan Decomposition
+
+You are the **planning agent** for a tiknix instance. Your ONLY job is to turn the
+goal below into a concrete, buildable multi-agent plan. You do NOT write code or
+edit files — you produce a plan that other agents will build.
+
+## Goal
+
+{$goal}
+
+## What already exists in THIS codebase — REUSE it, do not reinvent
+
+The inventory below was auto-generated from the live instance. Treat it as ground
+truth: it is what already exists right now. You do NOT need to call `codebase_map`
+(it's baked in below). You MAY still call `describe("<name>")` or
+`whatprovides("<concept>")` to drill into any single primitive before you commit.
+
+{$digest}
+
+## How to work
+
+1. **MATCH the goal against the inventory above — this is the most important step.**
+   For every capability the goal needs, classify it explicitly as ONE of:
+   - **REUSE** `<existing controller/model/lib>` — it already does this; wire to it.
+   - **EXTEND** `<existing>` — add a method / column / route to something that exists.
+   - **NEW** — nothing above fits; you MUST justify in the task's description why no
+     existing primitive covers it.
+   Bias hard toward REUSE/EXTEND. A plan that proposes NEW controllers, models, or
+   services when a close match already exists above is a defect — prefer a method on
+   an existing controller and a column on an existing model.
+
+2. **Decompose into the smallest sensible tasks.** Each task is one focused unit
+   of work a single agent can complete and commit on its own.
+
+3. **Express dependencies as a graph.** Every task gets a stable `id` (e.g. "t1").
+   List prerequisite ids in `depends_on`.
+   - Tasks with **no** shared files and no ordering constraint should have an
+     EMPTY `depends_on` — they will be built **in parallel, in isolated git
+     worktrees**, then merged.
+   - Tasks that touch the **same files**, or need another task's output, MUST be
+     chained via `depends_on` so they run sequentially and don't collide on merge.
+
+4. **Pick an engine per task.** `claude` for anything requiring judgement;
+   `qwen` only for simple mechanical edits.
+
+5. **Account for data & permissions as seeds — never write the live DB directly.**
+   A new route needs an `authcontrol` entry; new/seed data needs an idempotent
+   `database/seeds/*.php` script (Bean wrapper: findOne/dispense/store). RedBean
+   auto-creates a model's table on first store, so there is no CREATE TABLE — but the
+   permission row and any starter data MUST be shipped as a seed task. Reuse an
+   existing `<controller>::* = <level>` permission pattern from the inventory.
+
+## Deliverable
+
+When (and only when) you have MATCHED against the inventory and decided the breakdown,
+call the **`submit_plan`** MCP tool exactly once with:
+
+- `title` — short name for the whole plan
+- `summary` — 1-3 sentences on the approach, naming the main things you REUSE
+- `subtasks` — the array of tasks, each with:
+  - `id`, `title`, `priority` (1 highest .. 4 lowest), `engine`
+  - `description` — written in **Markdown**: lead with a one-line summary, then use
+    `##` sub-headers (e.g. What to build / Steps / Notes), `-` bullet lists, and
+    `` `inline code` `` for files, beans, and routes. Structure it so a builder agent
+    can scan the headers first, then drill into details.
+  - `files` — likely paths
+  - `depends_on` — array of prerequisite ids
+  - `reuses` — array of existing primitives this task builds on, as `kind/name`
+    strings (e.g. `["controller/Lead","model/member","lib/Mailer"]`). Empty ONLY for
+    genuinely new ground — and if it's empty, the description must say why.
+
+Do not ask the operator questions — make reasonable assumptions and note them in
+the relevant task descriptions. After `submit_plan` returns, reply `PLAN_WRITTEN`
+and stop.
+MD;
+    }
+
+    /**
+     * Auto-generated reuse inventory for the instance, injected into the plan
+     * brief so decomposition reuses existing primitives. Reuses the same
+     * Introspector that backs the tiknix MCP tools, pointed at the instance
+     * root. Never throws — a digest failure must not block planning.
+     */
+    private function codebaseDigest(): string {
+        try {
+            $file = dirname(__DIR__) . '/mcptools/Introspector.php';
+            if (is_file($file)) require_once $file;
+            $cls = 'app\\mcptools\\Introspector';
+            if (!class_exists($cls)) return '_(codebase inventory unavailable)_';
+            $d = (new $cls($this->instanceDir))->digest();
+            return $d !== '' ? $d : '_(codebase inventory unavailable)_';
+        } catch (\Throwable $e) {
+            return '_(codebase inventory unavailable: ' . $e->getMessage() . ')_';
+        }
+    }
+}
