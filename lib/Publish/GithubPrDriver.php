@@ -42,6 +42,24 @@ class GithubPrDriver implements PublishDriver {
         ];
     }
 
+    /**
+     * Any member may publish to a repo they own — it is their credential, their repo, and
+     * it costs this control plane nothing. The connection row is the real gate: without
+     * one there is nowhere to push.
+     */
+    public static function minLevel(string $op): int {
+        return LEVELS['MEMBER'];
+    }
+
+    /**
+     * Nothing to configure here. The repo, the branch and the token all come from the
+     * GitHub connection, which is set up on the Connections page — asking for them again
+     * would be a second place to get them wrong.
+     */
+    public static function fields(): array {
+        return [];
+    }
+
     /** Push the snapshot and open/reuse the PR. */
     public function deploy(object $inst, array $config, array $opts = []): array {
         $conn = self::connection($inst);
@@ -60,7 +78,11 @@ class GithubPrDriver implements PublishDriver {
 
         if (empty($res['ok'])) return ['ok' => false, 'error' => (string) ($res['error'] ?? 'Publish failed')];
 
-        $steps = ['Built a clean snapshot of the working tree', 'Pushed to ' . GitHubPublisher::BRANCH];
+        // Report the branch actually pushed, not the integration branch: an empty repo has
+        // no base to open a PR against, so the first publish initializes the DEFAULT branch
+        // instead, and saying "aibuilder-publish" there would be a lie in the run log.
+        $branch = (string) ($res['branch'] ?? GitHubPublisher::BRANCH);
+        $steps  = ['Built a clean snapshot of the working tree', 'Pushed to ' . $branch];
         if (!empty($res['pr']['url'])) $steps[] = 'Pull request: ' . $res['pr']['url'];
         if (!empty($res['note']))      $steps[] = $res['note'];
 
@@ -69,7 +91,7 @@ class GithubPrDriver implements PublishDriver {
             'steps'   => $steps,
             'message' => (string) ($res['message'] ?? 'Published'),
             'pr'      => $res['pr'] ?? null,
-            'branch'  => GitHubPublisher::BRANCH,
+            'branch'  => $branch,
         ];
     }
 

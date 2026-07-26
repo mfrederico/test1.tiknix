@@ -19,6 +19,8 @@ class PublishRegistry {
     private const DRIVERS = [
         'tiknix-hosted' => TiknixHostedDriver::class,
         'github-pr'     => GithubPrDriver::class,
+        'rsync'         => RsyncDriver::class,
+        'ssh'           => SshDriver::class,
     ];
 
     /**
@@ -37,6 +39,7 @@ class PublishRegistry {
                 'label'        => $class::label(),
                 'blurb'        => $class::blurb(),
                 'capabilities' => $class::capabilities(),
+                'fields'       => $class::fields(),
                 'available'    => $available,
                 'reason'       => $reason,
             ];
@@ -54,6 +57,19 @@ class PublishRegistry {
      */
     public static function hosting(): array {
         return array_values(array_filter(self::all(), fn($d) => empty($d['capabilities']['code'])));
+    }
+
+    /**
+     * Repository targets — the ones that answer "how does a change reach my code".
+     *
+     * The two kinds are ORTHOGONAL, not alternatives: a project can perfectly well open a
+     * pull request on its repo AND run in a container, because those answer different
+     * questions. Anything presenting targets as one-of-N is conflating them.
+     *
+     * @return array<int,array<string,mixed>>
+     */
+    public static function repository(): array {
+        return array_values(array_filter(self::all(), fn($d) => !empty($d['capabilities']['code'])));
     }
 
     /** @return PublishDriver|null */

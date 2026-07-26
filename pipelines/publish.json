@@ -3,7 +3,7 @@
     "name": "Publish",
     "steps": [
         {
-            "name": "publish",
+            "name": "publish_github_pr",
             "type": "publish",
             "config": {
                 "target": "github-pr",
@@ -11,10 +11,44 @@
             },
             "on_success": "next",
             "on_fail": "exit"
+        },
+        {
+            "name": "publish_rsync",
+            "type": "publish",
+            "config": {
+                "target": "rsync",
+                "op": "deploy",
+                "config": {
+                    "host": "127.0.0.1",
+                    "user": "ubuntu",
+                    "path": "/var/www/html/default/test-destination-rsync.tiknix"
+                }
+            },
+            "on_success": "next",
+            "on_fail": "exit"
+        },
+        {
+            "name": "publish_tiknix_hosted",
+            "type": "publish",
+            "config": {
+                "target": "tiknix-hosted",
+                "op": "deploy",
+                "config": {
+                    "domain": "tiknix.ngn.sh"
+                },
+                "timeout": 600
+            },
+            "on_success": "next",
+            "on_fail": "exit"
         }
     ],
     "publish": {
-        "driver": "github-pr",
-        "url": ""
+        "targets": [
+            "github-pr",
+            "rsync",
+            "tiknix-hosted"
+        ],
+        "domain": "tiknix.ngn.sh",
+        "url": "https://tiknix.ngn.sh"
     }
 }
