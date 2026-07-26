@@ -67,19 +67,13 @@ class GitHubPublisher {
         if (!$head['ok']) return $fail('This instance has no commits to publish yet.');
         $shortSha = substr(trim($head['out']), 0, 7);
 
-        // Build a CLEAN SNAPSHOT as one commit. Snapshot the CURRENT WORKING TREE (not just
-        // committed HEAD) so Publish always reflects the customer's latest edits even if they
-        // haven't checkpointed. A fresh temp index + `add -A` respects .gitignore, so the
-        // SQLite db, vendor/, real conf/*.ini, .aibuilder creds, caches and logs are excluded.
-        $tmpIndex = self::instanceDir($slug) . '/.git/aibuilder-publish.index';
-        @unlink($tmpIndex);
-        $ienv = ['GIT_INDEX_FILE' => $tmpIndex];
-        self::gitEnv($slug, $ienv, ['add', '-A']);
-        // Belt-and-suspenders: drop any secret config that slipped past .gitignore (keep examples).
-        self::gitEnv($slug, $ienv, ['rm', '--cached', '-r', '--ignore-unmatch', '--quiet',
-            'conf/*.ini', ':(exclude)conf/*.example.ini', '.aibuilder']);
-        $tree = trim(self::gitEnv($slug, $ienv, ['write-tree'])['out']);
-        @unlink($tmpIndex);
+        // Snapshot the CURRENT WORKING TREE (not just committed HEAD) so Publish always
+        // reflects the customer's latest edits even if they haven't checkpointed. What is
+        // and isn't publishable is Snapshot's single definition, shared with rsync — two
+        // mechanisms with two exclude lists eventually disagree, and the failure mode is
+        // shipping a database or a decrypted config.
+        $tree = \app\Publish\Snapshot::withIndex(self::instanceDir($slug), !empty($inst->isDefault),
+            fn(string $index) => trim(self::gitEnv($slug, ['GIT_INDEX_FILE' => $index], ['write-tree'])['out']));
         if ($tree === '') return $fail('could not build a clean snapshot tree');
         $url = 'https://x-access-token:' . $pat . '@github.com/' . $owner . '/' . $repo . '.git';
         $redact = fn($s) => $pat !== '' ? str_replace($pat, '***', $s) : $s;
@@ -116,7 +110,7 @@ class GitHubPublisher {
         if (!$baseExists) {
             $push = self::git($slug, ['push', '--force', $url, $commit . ':refs/heads/' . $base]);
             if (!$push['ok']) return $fail('git push failed: ' . $redact($push['out']));
-            return ['ok' => true, 'pushed' => true, 'pr' => null,
+            return ['ok' => true, 'pushed' => true, 'pr' => null, 'branch' => $base,
                 'message' => 'Published to ' . $owner . '/' . $repo . ' (initialized ' . $base . ')', 'error' => null];
         }
 
@@ -137,11 +131,11 @@ class GitHubPublisher {
                        . '- HEAD: `' . $shortSha . "`\n";
                 $pr = $gh->createPullRequest($title, $body, self::BRANCH, $base, false);
             }
-            return ['ok' => true, 'pushed' => true,
+            return ['ok' => true, 'pushed' => true, 'branch' => self::BRANCH,
                 'pr' => ['number' => $pr['number'] ?? null, 'url' => $pr['html_url'] ?? null],
                 'message' => 'Published to ' . $owner . '/' . $repo . ($reused ? ' (updated existing PR)' : ''), 'error' => null];
         } catch (\Throwable $e) {
-            return ['ok' => true, 'pushed' => true, 'pr' => null,
+            return ['ok' => true, 'pushed' => true, 'pr' => null, 'branch' => self::BRANCH,
                 'message' => 'Pushed to ' . $owner . '/' . $repo, 'error' => null,
                 'note' => 'PR could not be created: ' . $e->getMessage()];
         }
